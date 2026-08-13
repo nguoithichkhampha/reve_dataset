@@ -45,6 +45,7 @@ PHYSIONET_DATASETS = {
     },
     "i-care": {
         "id": "i-care",
+        "s3_path": "s3://physionet-open/i-care/2.1/",
         "url": "https://physionet.org/files/i-care/2.1/",
         "description": "I-CARE — cardiac arrest EEG, 1.5 TB uncompressed",
     },

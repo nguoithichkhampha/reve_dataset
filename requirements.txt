@@ -1,9 +1,1 @@
-# Core: no Python package dependencies — uses rsync, wget, and aws CLI via subprocess.
-#
-# System requirements:
-#   - rsync          (for TUH — pre-installed on macOS/Linux)
-#   - wget           (for PhysioNet — brew install wget / apt install wget)
-#   - aws CLI        (for OpenNeuro — pip install awscli)
-#
-# Optional fallback for OpenNeuro if aws CLI is not installed:
-# openneuro-py>=2025.2.0
+google-cloud-storage-transfer>=1.14.0
