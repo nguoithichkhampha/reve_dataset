@@ -1,14 +1,45 @@
 TUH_DATASETS = {
-    "tuh_eeg": {
-        "id": "tuh_eeg",
-        "rsync_path": "data/tuh_eeg/",
-        "description": "TUH EEG Corpus — 14,987 subjects, 26,847 hours",
+    "tueg": {
+        "id": "tueg",
+        "rsync_path": "data/tuh_eeg/tuh_eeg/v2.0.2",
+        "description": "TUEG — TUH EEG Corpus, 26,846 clinical EEG recordings (2002-2017)",
+    },
+    "tuab": {
+        "id": "tuab",
+        "rsync_path": "data/tuh_eeg/tuh_eeg_abnormal/v3.0.1",
+        "description": "TUAB — TUH Abnormal EEG Corpus, normal/abnormal annotations",
+    },
+    "tuar": {
+        "id": "tuar",
+        "rsync_path": "data/tuh_eeg/tuh_eeg_artifact/v3.0.1",
+        "description": "TUAR — TUH EEG Artifact Corpus, 5 artifact types annotated",
+    },
+    "tuep": {
+        "id": "tuep",
+        "rsync_path": "data/tuh_eeg/tuh_eeg_epilepsy/v3.1.0",
+        "description": "TUEP — TUH EEG Epilepsy Corpus, 100 epilepsy + 100 non-epilepsy subjects",
+    },
+    "tuev": {
+        "id": "tuev",
+        "rsync_path": "data/tuh_eeg/tuh_eeg_events/v2.0.1",
+        "description": "TUEV — TUH EEG Events Corpus, 6 event classes (SPSW, GPED, PLED, EYEM, ARTF, BCKG)",
+    },
+    "tusz": {
+        "id": "tusz",
+        "rsync_path": "data/tuh_eeg/tuh_eeg_seizure/v2.0.6",
+        "description": "TUSZ — TUH EEG Seizure Corpus, seizure event annotations",
+    },
+    "tusl": {
+        "id": "tusl",
+        "rsync_path": "data/tuh_eeg/tuh_eeg_slowing/v2.0.1",
+        "description": "TUSL — TUH EEG Slowing Corpus, slowing event annotations",
     },
 }
 
 PHYSIONET_DATASETS = {
     "siena-scalp-eeg": {
         "id": "siena-scalp-eeg",
+        "s3_path": "s3://physionet-open/siena-scalp-eeg/1.0.0/",
         "url": "https://physionet.org/files/siena-scalp-eeg/1.0.0/",
         "description": "Siena Scalp EEG — 14 epileptic patients, seizure recordings",
     },
@@ -71,8 +102,7 @@ OPENNEURO_DATASETS = {
     "ds005510": {"id": "ds005510", "description": "HBN Release 6"},
     "ds005511": {"id": "ds005511", "description": "HBN Release 7"},
     "ds005512": {"id": "ds005512", "description": "HBN Release 8"},
-    "ds005513": {"id": "ds005513", "description": "HBN Release 9"},
-    "ds005514": {"id": "ds005514", "description": "HBN Release 10"},
+    "ds005514": {"id": "ds005514", "description": "HBN Release 9"},
     "ds005697": {"id": "ds005697", "description": "OpenNeuro ds005697"},
     "ds005620": {"id": "ds005620", "description": "OpenNeuro ds005620"},
     "ds005594": {"id": "ds005594", "description": "OpenNeuro ds005594"},

@@ -20,13 +20,17 @@ def timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def download_tuh(dataset_info, output_dir, tuh_user):
+def download_tuh(dataset_info, output_dir, tuh_user, tuh_ssh_key):
     dataset_id = dataset_info["id"]
     dest = os.path.join(output_dir, "tuh")
     os.makedirs(dest, exist_ok=True)
 
-    rsync_src = f"{tuh_user}@{TUH_RSYNC_HOST}:~/{dataset_info['rsync_path']}"
-    cmd = ["rsync", "-auxvz", rsync_src, dest]
+    rsync_src = f"{tuh_user}@{TUH_RSYNC_HOST}:{dataset_info['rsync_path']}"
+    cmd = [
+        "rsync", "-auvxL",
+        "-e", f"ssh -i {tuh_ssh_key}",
+        rsync_src, dest,
+    ]
 
     print(f"[{timestamp()}] START  tuh/{dataset_id}")
     print(f"  cmd: {' '.join(cmd)}")
@@ -44,13 +48,17 @@ def download_physionet(dataset_info, output_dir):
     dest = os.path.join(output_dir, "physionet", dataset_id)
     os.makedirs(dest, exist_ok=True)
 
-    url = dataset_info["url"]
-    cmd = [
-        "wget", "-r", "-N", "-c", "-np", "-nH",
-        "--cut-dirs=2",
-        "-P", dest,
-        url,
-    ]
+    s3_path = dataset_info.get("s3_path")
+    if s3_path and shutil.which("aws"):
+        cmd = ["aws", "s3", "sync", "--no-sign-request", s3_path, dest]
+    else:
+        url = dataset_info["url"]
+        cmd = [
+            "wget", "-r", "-N", "-c", "-np", "-nH",
+            "--cut-dirs=2",
+            "-P", dest,
+            url,
+        ]
 
     print(f"[{timestamp()}] START  physionet/{dataset_id}")
     print(f"  cmd: {' '.join(cmd)}")
@@ -90,23 +98,23 @@ def download_openneuro(dataset_info, output_dir):
 
 
 def _download_worker(args):
-    source, dataset_info, output_dir, tuh_user = args
+    source, dataset_info, output_dir, tuh_user, tuh_ssh_key = args
     if source == "tuh":
-        return download_tuh(dataset_info, output_dir, tuh_user)
+        return download_tuh(dataset_info, output_dir, tuh_user, tuh_ssh_key)
     elif source == "physionet":
         return download_physionet(dataset_info, output_dir)
     elif source == "openneuro":
         return download_openneuro(dataset_info, output_dir)
 
 
-def collect_tasks(sources, dataset_filter, tuh_user, output_dir):
+def collect_tasks(sources, dataset_filter, tuh_user, tuh_ssh_key, output_dir):
     tasks = []
     for source in sources:
         registry = ALL_SOURCES[source]
         for ds_id, ds_info in registry.items():
             if dataset_filter and ds_id not in dataset_filter:
                 continue
-            tasks.append((source, ds_info, output_dir, tuh_user))
+            tasks.append((source, ds_info, output_dir, tuh_user, tuh_ssh_key))
     return tasks
 
 
@@ -173,8 +181,13 @@ def parse_args():
     )
     parser.add_argument(
         "--tuh-user",
-        default=os.environ.get("TUH_USER", "nedc_tuh_eeg"),
-        help="TUH rsync username (default: TUH_USER env or nedc_tuh_eeg).",
+        default=os.environ.get("TUH_USER", "nedc-tuh-eeg"),
+        help="TUH rsync username (default: TUH_USER env or nedc-tuh-eeg).",
+    )
+    parser.add_argument(
+        "--tuh-ssh-key",
+        default=os.environ.get("TUH_SSH_KEY", "~/.ssh/id_ed25519"),
+        help="Path to SSH key for TUH rsync (default: TUH_SSH_KEY env or ~/.ssh/id_ed25519).",
     )
     parser.add_argument(
         "--datasets",
@@ -197,6 +210,7 @@ def main():
         sources=args.source,
         dataset_filter=set(args.datasets) if args.datasets else None,  # type: ignore[arg-type]
         tuh_user=args.tuh_user,
+        tuh_ssh_key=os.path.expanduser(args.tuh_ssh_key),
         output_dir=args.output_dir,
     )
 
