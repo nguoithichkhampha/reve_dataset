@@ -86,6 +86,7 @@ class CollectDatasetStatsFn(beam.DoFn):
             "channel_count": len(eeg_channels) if eeg_channels else None,
             "eeg_channels": eeg_channels or [],
             "durations": eeg_params["durations"],
+            "task_durations": eeg_params["task_durations"],
             "tasks": sorted(file_stats["task_sizes"].keys()),
             "references": eeg_params["references"],
             "manufacturers": eeg_params["manufacturers"],
@@ -97,10 +98,11 @@ class CollectDatasetStatsFn(beam.DoFn):
             "task_file_counts": file_stats["task_file_counts"],
             "task_subjects": file_stats["task_subjects"],
         }
+        total_dur_h = round(sum(result["durations"]) / 3600, 2) if result["durations"] else 0
         logger.info(
-            "%s: %d subjects, %d files, %s",
+            "%s: %d subjects, %d files, %s, %.1f hours",
             dataset_id, n_subjects, result["n_files"],
-            human_size(result["total_size"]),
+            human_size(result["total_size"]), total_dur_h,
         )
         yield result
 
@@ -119,8 +121,11 @@ class CollectDatasetStatsFn(beam.DoFn):
             return {"count": 0, "ages": [], "sex_counts": {}}
 
     def _parse_eeg_params(self, fs):
+        from pipelines.stats.parsers import extract_task_from_filename
+
         sampling_rates = set()
         durations = []
+        task_durations = {}
         references = set()
         manufacturers = set()
 
@@ -131,7 +136,12 @@ class CollectDatasetStatsFn(beam.DoFn):
                 if "sampling_rate" in params:
                     sampling_rates.add(params["sampling_rate"])
                 if "duration" in params:
-                    durations.append(params["duration"])
+                    dur = params["duration"]
+                    durations.append(dur)
+                    fname = rel_path.rsplit("/", 1)[-1] if "/" in rel_path else rel_path
+                    task = extract_task_from_filename(fname)
+                    if task:
+                        task_durations[task] = task_durations.get(task, 0.0) + dur
                 if "reference" in params:
                     references.add(params["reference"])
                 if "manufacturer" in params:
@@ -142,6 +152,7 @@ class CollectDatasetStatsFn(beam.DoFn):
         return {
             "sampling_rates": sorted(sampling_rates),
             "durations": durations,
+            "task_durations": task_durations,
             "references": sorted(references),
             "manufacturers": sorted(manufacturers),
         }
@@ -219,6 +230,7 @@ class FormatOutputFn(beam.DoFn):
             "total_files": agg["total_files"],
             "total_size_bytes": agg["total_size"],
             "total_size_human": human_size(agg["total_size"]),
+            "total_duration_hours": agg["duration_stats"].get("total_hours", 0),
         }
         summary_blob = bucket.blob(f"{self._output_prefix}summary.json")
         summary_blob.upload_from_string(
@@ -277,12 +289,15 @@ def run(argv=None):
 
     dataset_ids = known_args.datasets or list(OPENNEURO_DATASETS.keys())
 
-    if not any(arg.startswith("--runner") for arg in pipeline_args):
-        pipeline_args.append("--runner=DirectRunner")
+    use_direct = not any(arg.startswith("--runner") for arg in pipeline_args)
 
     pipeline_options = PipelineOptions(pipeline_args)
 
-    p = beam.Pipeline(options=pipeline_options)
+    if use_direct:
+        from apache_beam.runners.direct.direct_runner import BundleBasedDirectRunner
+        p = beam.Pipeline(runner=BundleBasedDirectRunner(), options=pipeline_options)
+    else:
+        p = beam.Pipeline(options=pipeline_options)
 
     stats = (
         p

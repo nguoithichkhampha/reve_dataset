@@ -340,6 +340,7 @@ def aggregate_stats(all_datasets):
             "max": max(all_durations),
             "mean": statistics.mean(all_durations),
             "median": statistics.median(all_durations),
+            "total_hours": round(sum(all_durations) / 3600, 2),
         }
 
     return {
@@ -438,6 +439,7 @@ def format_report(all_datasets, agg):
         lines.append(f"    Range:  {dur['min']:.1f} - {dur['max']:.1f}")
         lines.append(f"    Mean:   {dur['mean']:.1f}")
         lines.append(f"    Median: {dur['median']:.1f}")
+        lines.append(f"    Total:  {dur['total_hours']:,.1f} hours")
 
     lines.append("\n  EEG formats — datasets using each:")
     for fmt, count in agg["eeg_formats"].most_common():
@@ -501,6 +503,7 @@ def format_csv(all_datasets):
         "sampling_rates", "channel_count", "eeg_channels",
         "eeg_formats", "references", "manufacturers",
         "n_files", "total_size_bytes", "total_size_human",
+        "duration_hours",
     ]
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=fieldnames)
@@ -530,8 +533,14 @@ def format_csv(all_datasets):
             "total_size_bytes": d["total_size"],
             "total_size_human": human_size(d["total_size"]),
         }
+        total_duration_s = sum(d["durations"]) if d["durations"] else 0
+        task_durations = d.get("task_durations", {})
         tasks = d["tasks"] if d["tasks"] else [""]
         for task in tasks:
+            if task:
+                task_dur_s = task_durations.get(task, 0)
+            else:
+                task_dur_s = total_duration_s
             row = {
                 **base,
                 "task": task,
@@ -539,6 +548,7 @@ def format_csv(all_datasets):
                 "n_files": d["task_file_counts"].get(task, 0) if task else d["n_files"],
                 "total_size_bytes": d["task_sizes"].get(task, 0) if task else d["total_size"],
                 "total_size_human": human_size(d["task_sizes"].get(task, 0)) if task else human_size(d["total_size"]),
+                "duration_hours": round(task_dur_s / 3600, 2) if task_dur_s else "",
             }
             writer.writerow(row)
     return output.getvalue()

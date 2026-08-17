@@ -3,7 +3,7 @@
 Preprocessing steps (in order):
   1. Auto-select montage by best channel match:
      standard_1020, standard_1005, GSN-HydroCel-{32,64,65,128,129,256,257}, EGI_256
-  2. Bandpass filter (0.1-100 Hz, FIR)
+  2. Bandpass filter (0.5-45 Hz, FIR)
   3. Notch filter (50/60 Hz + harmonics, from sidecar PowerLineFrequency)
   4. Drop flat reference channel if present in data
      (channel name parsed from sidecar EEGReference, verified flat by RMS < 1% median)
@@ -229,7 +229,7 @@ class PreprocessEEGFn(beam.DoFn):
 
         self._set_montage(raw)
 
-        raw.filter(l_freq=0.1, h_freq=100.0, fir_design="firwin")
+        raw.filter(l_freq=0.5, h_freq=42.0, fir_design="firwin")
 
         if powerline_freq and powerline_freq > 0:
             freqs = [powerline_freq]
@@ -251,10 +251,22 @@ class PreprocessEEGFn(beam.DoFn):
         bad_channels = [raw.ch_names[i] for i, is_bad in enumerate(bad_mask) if is_bad]
 
         if bad_channels and len(bad_channels) < len(raw.ch_names) * 0.3:
-            raw.info["bads"] = bad_channels
-            try:
-                raw.interpolate_bads(reset_bads=True)
-            except Exception:
+            pos = raw._get_channel_positions()
+            has_pos = {
+                raw.ch_names[i]
+                for i in range(len(pos))
+                if not np.any(np.isnan(pos[i]))
+            }
+            interpolable = [ch for ch in bad_channels if ch in has_pos]
+            no_pos = [ch for ch in raw.ch_names if ch not in has_pos]
+
+            if interpolable:
+                raw.info["bads"] = interpolable
+                try:
+                    raw.interpolate_bads(reset_bads=True, exclude=no_pos)
+                except Exception:
+                    raw.info["bads"] = []
+            else:
                 raw.info["bads"] = []
         meta["bad_channels"] = bad_channels
 
@@ -392,8 +404,8 @@ class PreprocessEEGFn(beam.DoFn):
             f.create_dataset("channel_names", data=ch_names)
 
             preproc_group = f.create_group("preprocessing")
-            preproc_group.attrs["bandpass_low"] = 0.1
-            preproc_group.attrs["bandpass_high"] = 100.0
+            preproc_group.attrs["bandpass_low"] = 0.5
+            preproc_group.attrs["bandpass_high"] = 42.0
             preproc_group.attrs["reference"] = preproc_meta.get("reference", "average")
             preproc_group.attrs["z_normalized"] = preproc_meta.get("z_normalized", False)
 

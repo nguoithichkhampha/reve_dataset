@@ -1,21 +1,21 @@
-"""Apache Beam pipeline for EEG preprocessing.
+"""Apache Beam pipeline for TUH EEG preprocessing.
 
-Produces one HDF5 per dataset with all recordings, structured for training
-dataloader filtering by n_channels, task, and subject.
+Produces one HDF5 per TUH group (000-149) with all recordings, structured
+for training dataloader filtering by n_channels, patient, and session.
 
 Usage:
-    # Local (DirectRunner) — test with a single dataset:
-    python -m pipelines.eeg.eeg_pipeline \
+    # Local (DirectRunner) — test with one group:
+    python -m pipelines.tuh.tuh_pipeline \
         --bucket emotiv-reve-data \
-        --prefix openneuro/ \
-        --output-prefix preprocessed/openneuro/ \
-        --datasets ds002680
+        --prefix tuh/tueg/v2.0.2/ \
+        --output-prefix preprocessed/tuh/ \
+        --groups 000
 
     # Dataflow:
-    python -m pipelines.eeg.eeg_pipeline \
+    python -m pipelines.tuh.tuh_pipeline \
         --bucket emotiv-reve-data \
-        --prefix openneuro/ \
-        --output-prefix preprocessed/openneuro/ \
+        --prefix tuh/tueg/v2.0.2/ \
+        --output-prefix preprocessed/tuh/ \
         --runner DataflowRunner \
         --project emotivml \
         --region us-central1 \
@@ -34,46 +34,50 @@ import logging
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions
 
-from pipelines.eeg.file_groups import discover_file_groups
-from pipelines.eeg.preprocessing import MergeDatasetHDF5Fn, PreprocessEEGFn
+from pipelines.tuh.file_groups import discover_file_groups
+from pipelines.tuh.preprocessing import TUHMergeGroupHDF5Fn, TUHPreprocessEEGFn
 
 logger = logging.getLogger(__name__)
 
 MAX_FILE_BYTES = 20 * 1024**3
+ALL_GROUPS = [f"{i:03d}" for i in range(150)]
 
 
-class DiscoverFileGroupsFn(beam.DoFn):
-    """Discover all EEG file groups for a dataset."""
+class DiscoverTUHFileGroupsFn(beam.DoFn):
+    """Discover all EDF recordings for a TUH group."""
 
     def __init__(self, bucket_name, prefix, project=None):
         self._bucket_name = bucket_name
         self._prefix = prefix
         self._project = project
 
-    def process(self, dataset_id):
-        logger.info("Discovering file groups for %s", dataset_id)
+    def process(self, group_id):
+        logger.info("Discovering EDF files for group %s", group_id)
         try:
             groups = discover_file_groups(
-                self._bucket_name, dataset_id, self._prefix,
+                self._bucket_name, group_id, self._prefix,
                 project=self._project,
             )
-            logger.info("%s: found %d recording(s)", dataset_id, len(groups))
+            logger.info("Group %s: found %d recording(s)", group_id, len(groups))
             for fg in groups:
                 yield fg.to_dict()
         except Exception as e:
-            logger.error("Discovery failed for %s: %s", dataset_id, e)
+            logger.error("Discovery failed for group %s: %s", group_id, e)
 
 
-def add_eeg_options(parser):
+def add_tuh_options(parser):
     parser.add_argument("--bucket", required=True, help="GCS bucket name")
-    parser.add_argument("--prefix", default="openneuro/", help="Prefix within bucket")
     parser.add_argument(
-        "--output-prefix", default="preprocessed/openneuro/",
+        "--prefix", default="tuh/tueg/v2.0.2/",
+        help="Prefix within bucket for TUH dataset",
+    )
+    parser.add_argument(
+        "--output-prefix", default="preprocessed/tuh/",
         help="Output prefix within the same bucket",
     )
     parser.add_argument(
-        "--datasets", nargs="*", default=None,
-        help="Specific dataset IDs (default: all from registry)",
+        "--groups", nargs="*", default=None,
+        help="Specific group IDs to process (default: all 000-149)",
     )
     parser.add_argument(
         "--max-file-bytes", type=int, default=MAX_FILE_BYTES,
@@ -81,7 +85,7 @@ def add_eeg_options(parser):
     )
     parser.add_argument(
         "--manifest-output", default=None,
-        help="GCS path for the output manifest JSONL file",
+        help="GCS path for the output manifest file",
     )
     parser.add_argument(
         "--gcp-project", default="emotivml",
@@ -99,15 +103,12 @@ def add_eeg_options(parser):
 
 def run(argv=None):
     import argparse
-    import sys
-    sys.path.insert(0, ".")
-    from datasets_config import OPENNEURO_DATASETS
 
     parser = argparse.ArgumentParser()
-    add_eeg_options(parser)
+    add_tuh_options(parser)
     known_args, pipeline_args = parser.parse_known_args(argv)
 
-    dataset_ids = known_args.datasets or list(OPENNEURO_DATASETS.keys())
+    group_ids = known_args.groups or ALL_GROUPS
     max_bytes = known_args.max_file_bytes
 
     manifest_path = known_args.manifest_output
@@ -128,18 +129,18 @@ def run(argv=None):
 
     preprocessed = (
         p
-        | "CreateDatasetIDs" >> beam.Create(dataset_ids)
+        | "CreateGroupIDs" >> beam.Create(group_ids)
         | "DiscoverFileGroups" >> beam.ParDo(
-            DiscoverFileGroupsFn(
+            DiscoverTUHFileGroupsFn(
                 known_args.bucket, known_args.prefix,
                 project=known_args.gcp_project,
             )
         )
         | "FilterBySize" >> beam.Filter(
-            lambda fg: fg["total_bytes"] <= max_bytes
+            lambda fg: fg["size_bytes"] <= max_bytes
         )
         | "Preprocess" >> beam.ParDo(
-            PreprocessEEGFn(
+            TUHPreprocessEEGFn(
                 known_args.bucket,
                 known_args.prefix,
                 known_args.output_prefix,
@@ -151,9 +152,9 @@ def run(argv=None):
 
     merge_outputs = (
         preprocessed.success
-        | "GroupByDataset" >> beam.GroupByKey()
+        | "GroupByGroup" >> beam.GroupByKey()
         | "MergeHDF5" >> beam.ParDo(
-            MergeDatasetHDF5Fn(
+            TUHMergeGroupHDF5Fn(
                 known_args.bucket,
                 known_args.output_prefix,
                 project=known_args.gcp_project,
@@ -161,7 +162,6 @@ def run(argv=None):
         ).with_outputs("manifest", main="summary")
     )
 
-    # Write per-dataset summary
     (
         merge_outputs.summary
         | "SummaryToJSON" >> beam.Map(json.dumps)
@@ -172,8 +172,7 @@ def run(argv=None):
         )
     )
 
-    # Write per-recording manifest CSV for dataloader filtering
-    MANIFEST_HEADER = "dataset_id,h5_file,h5_path,subject,session,task,run,n_channels,sfreq,n_samples,duration_s"
+    MANIFEST_HEADER = "group_id,h5_file,h5_path,patient_id,session,montage,token,n_channels,sfreq,n_samples,duration_s"
 
     def manifest_to_csv_row(row):
         return ",".join(str(row.get(col, "")) for col in MANIFEST_HEADER.split(","))
