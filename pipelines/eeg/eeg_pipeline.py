@@ -21,11 +21,12 @@ Usage:
         --region us-central1 \
         --temp_location gs://emotiv-reve-data/dataflow-temp/ \
         --setup_file ./setup.py \
-        --machine_type n1-highmem-4 \
+        --machine_type n1-highmem-8 \
         --max_num_workers 32 \
         --disk_size_gb 500 \
         --disk_type compute.googleapis.com/projects/emotivml/zones/us-central1-a/diskTypes/pd-ssd \
-        --no-wait
+        --number_of_worker_harness_threads 1 \
+        --no-wait --target-sfreq 128
 """
 
 import json
@@ -95,6 +96,14 @@ def add_eeg_options(parser):
         "--target-sfreq", type=float, default=None,
         help="Resample all recordings to this frequency (Hz). If not set, keep original.",
     )
+    parser.add_argument(
+        "--shard-datasets", nargs="*", default=None,
+        help="Datasets to shard for parallel merge, format: DATASET_ID:N_SHARDS (e.g. ds004395:8)",
+    )
+    parser.add_argument(
+        "--exclude-datasets", nargs="*", default=None,
+        help="Dataset IDs to exclude from processing (e.g. ds004395)",
+    )
 
 
 def run(argv=None):
@@ -108,7 +117,16 @@ def run(argv=None):
     known_args, pipeline_args = parser.parse_known_args(argv)
 
     dataset_ids = known_args.datasets or list(OPENNEURO_DATASETS.keys())
+    if known_args.exclude_datasets:
+        exclude = set(known_args.exclude_datasets)
+        dataset_ids = [d for d in dataset_ids if d not in exclude]
     max_bytes = known_args.max_file_bytes
+
+    shard_map = {}
+    if known_args.shard_datasets:
+        for spec in known_args.shard_datasets:
+            ds_id, n = spec.split(":")
+            shard_map[ds_id] = int(n)
 
     manifest_path = known_args.manifest_output
     if not manifest_path:
@@ -118,7 +136,7 @@ def run(argv=None):
 
     use_direct = not any(arg.startswith("--runner") for arg in pipeline_args)
 
-    pipeline_options = PipelineOptions(pipeline_args)
+    pipeline_options = PipelineOptions(pipeline_args, pipeline_type_check=False)
 
     if use_direct:
         from apache_beam.runners.direct.direct_runner import BundleBasedDirectRunner
@@ -145,6 +163,7 @@ def run(argv=None):
                 known_args.output_prefix,
                 project=known_args.gcp_project,
                 target_sfreq=known_args.target_sfreq,
+                shard_map=shard_map,
             )
         ).with_outputs("failed", main="success")
     )

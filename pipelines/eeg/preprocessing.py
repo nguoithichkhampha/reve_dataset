@@ -12,9 +12,9 @@ Preprocessing steps (in order):
      Only re-references recordings with: linked ears, mastoid, common, CMS/DRL.
      Keeps as-is: average ref, single-electrode online refs (Cz, FCz, Fz, etc.),
      and unknown references.
-  7. Z-score normalization per channel (mean=0, std=1 computed across recording),
+  7. Resample to target frequency (optional, via --target-sfreq, polyphase)
+  8. Z-score normalization per channel (mean=0, std=1 computed across recording),
      then clip values exceeding ±15 standard deviations
-  8. Resample to target frequency (optional, via --target-sfreq)
 
 Two DoFns:
   - PreprocessEEGFn: processes one recording, saves temp HDF5 to GCS,
@@ -80,12 +80,14 @@ class PreprocessEEGFn(beam.DoFn):
     and will be merged into one file per dataset by MergeDatasetHDF5Fn.
     """
 
-    def __init__(self, bucket_name, prefix, output_prefix, project=None, target_sfreq=None):
+    def __init__(self, bucket_name, prefix, output_prefix, project=None,
+                 target_sfreq=None, shard_map=None):
         self._bucket_name = bucket_name
         self._prefix = prefix
         self._output_prefix = output_prefix
         self._project = project
         self._target_sfreq = target_sfreq
+        self._shard_map = shard_map or {}
 
     def setup(self):
         mne.set_log_level("WARNING")
@@ -118,6 +120,16 @@ class PreprocessEEGFn(beam.DoFn):
             primary_local = os.path.join(
                 tmp_dir, fg.primary_blob.replace("/", os.sep)
             )
+
+            if fg.format == "brainvision":
+                vmrk_path = os.path.splitext(primary_local)[0] + ".vmrk"
+                if not os.path.exists(vmrk_path):
+                    with open(vmrk_path, "w") as vmrk_f:
+                        vmrk_f.write(
+                            "Brain Vision Data Exchange Marker File Version 1.0\n\n"
+                            "[Common Infos]\nCodepage=UTF-8\n\n"
+                            "[Marker Infos]\n"
+                        )
 
             sidecar_params = self._get_sidecar_params(fs, fg)
 
@@ -170,7 +182,13 @@ class PreprocessEEGFn(beam.DoFn):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         if meta["status"] == "success":
-            yield (fg.dataset_id, meta)
+            n_shards = self._shard_map.get(fg.dataset_id, 1)
+            if n_shards > 1:
+                shard = hash(fg.subject) % n_shards
+                key = f"{fg.dataset_id}_shard{shard:03d}"
+            else:
+                key = fg.dataset_id
+            yield (key, meta)
         else:
             yield beam.pvalue.TaggedOutput("failed", meta)
 
@@ -513,14 +531,16 @@ class MergeDatasetHDF5Fn(beam.DoFn):
         self._project = project
 
     def process(self, element):
-        dataset_id, recording_metas = element
+        merge_key, recording_metas = element
         recording_metas = list(recording_metas)
 
         if not recording_metas:
             return
 
+        dataset_id = recording_metas[0].get("dataset_id", merge_key)
+
         logger.info(
-            "Merging %d recordings for %s", len(recording_metas), dataset_id
+            "Merging %d recordings for %s", len(recording_metas), merge_key
         )
 
         tmp_dir = tempfile.mkdtemp(prefix="eeg_merge_")
@@ -528,7 +548,7 @@ class MergeDatasetHDF5Fn(beam.DoFn):
         temp_fs = GCSDatasetFS(self._bucket_name, temp_prefix, project=self._project)
 
         try:
-            merged_path = os.path.join(tmp_dir, f"{dataset_id}_preprocessed.h5")
+            merged_path = os.path.join(tmp_dir, f"{merge_key}_preprocessed.h5")
 
             all_tasks = set()
             all_subjects = set()
@@ -600,7 +620,7 @@ class MergeDatasetHDF5Fn(beam.DoFn):
             out_fs = GCSDatasetFS(
                 self._bucket_name, self._output_prefix, project=self._project
             )
-            output_blob = f"{dataset_id}_preprocessed.h5"
+            output_blob = f"{merge_key}_preprocessed.h5"
             out_fs.upload_from_file(output_blob, merged_path)
 
             self._cleanup_temp_blobs(temp_fs, recording_metas)
@@ -609,7 +629,7 @@ class MergeDatasetHDF5Fn(beam.DoFn):
             file_size = os.path.getsize(merged_path)
             logger.info(
                 "Merged %s: %d recordings -> %s (%.1f MB)",
-                dataset_id, len(recording_metas), output_path,
+                merge_key, len(recording_metas), output_path,
                 file_size / 1024 / 1024,
             )
 
@@ -638,9 +658,10 @@ class MergeDatasetHDF5Fn(beam.DoFn):
             }
 
         except Exception as e:
-            logger.error("Merge failed for %s: %s", dataset_id, e)
+            logger.error("Merge failed for %s: %s", merge_key, e)
             yield {
                 "dataset_id": dataset_id,
+                "merge_key": merge_key,
                 "status": "merge_failed",
                 "error": str(e),
             }

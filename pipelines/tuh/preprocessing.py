@@ -10,8 +10,8 @@ Preprocessing steps (in order):
   7. Selective re-reference to average
      Only re-references linked-ears montages (02_tcp_le, 04_tcp_le_a).
      Keeps as-is: average-referenced montages (01_tcp_ar, 03_tcp_ar_a).
-  8. Z-score normalization per channel + clip at ±15 SD
-  9. Resample to target frequency (optional, via --target-sfreq)
+  8. Resample to target frequency (optional, via --target-sfreq, polyphase)
+  9. Z-score normalization per channel + clip at ±15 SD
 
 Two DoFns:
   - TUHPreprocessEEGFn: processes one EDF recording, saves temp HDF5 to GCS,

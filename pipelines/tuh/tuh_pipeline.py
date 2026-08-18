@@ -21,11 +21,12 @@ Usage:
         --region us-central1 \
         --temp_location gs://emotiv-reve-data/dataflow-temp/ \
         --setup_file ./setup.py \
-        --machine_type n1-highmem-4 \
+        --machine_type n1-highmem-8 \
         --max_num_workers 32 \
         --disk_size_gb 500 \
         --disk_type compute.googleapis.com/projects/emotivml/zones/us-central1-a/diskTypes/pd-ssd \
-        --no-wait
+        --number_of_worker_harness_threads 1 \
+        --no-wait --target-sfreq 128
 """
 
 import json
@@ -119,7 +120,7 @@ def run(argv=None):
 
     use_direct = not any(arg.startswith("--runner") for arg in pipeline_args)
 
-    pipeline_options = PipelineOptions(pipeline_args)
+    pipeline_options = PipelineOptions(pipeline_args, pipeline_type_check=False)
 
     if use_direct:
         from apache_beam.runners.direct.direct_runner import BundleBasedDirectRunner

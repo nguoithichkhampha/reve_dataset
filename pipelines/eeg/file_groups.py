@@ -104,6 +104,8 @@ def discover_file_groups(bucket_name, dataset_id, prefix="openneuro/", project=N
 
     stems = defaultdict(lambda: {"files": [], "total_size": 0})
     for rel_path, size in fs.list_all_blobs():
+        if rel_path.startswith("derivatives/") or "/derivatives/" in rel_path:
+            continue
         if "/eeg/" not in f"/{rel_path}/" and not rel_path.endswith(
             tuple(PRIMARY_EXTENSIONS) + tuple(AUX_EXTENSIONS)
         ):
