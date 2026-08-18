@@ -8,9 +8,10 @@ Preprocessing steps (in order):
   4. Drop flat reference channel if present in data
      (channel name parsed from sidecar EEGReference, verified flat by RMS < 1% median)
   5. Bad channel detection (RMS > 3 SD from median) and interpolation
-  6. Re-reference to average
-     (skipped if sidecar EEGReference indicates already average-referenced,
-      e.g. "average", "common", "Cz; common")
+  6. Selective re-reference to average
+     Only re-references recordings with: linked ears, mastoid, common, CMS/DRL.
+     Keeps as-is: average ref, single-electrode online refs (Cz, FCz, Fz, etc.),
+     and unknown references.
   7. Z-score normalization per channel (mean=0, std=1 computed across recording),
      then clip values exceeding ±15 standard deviations
   8. Resample to target frequency (optional, via --target-sfreq)
@@ -55,6 +56,7 @@ import h5py
 import mne
 import numpy as np
 
+from pipelines import BANDPASS_LOW, BANDPASS_HIGH, CLIP_STD, H5_CHUNK_SECONDS
 from pipelines.gcs_fs import GCSDatasetFS
 from pipelines.eeg.file_groups import EEGFileGroup
 from pipelines.stats.parsers import parse_eeg_json
@@ -130,6 +132,12 @@ class PreprocessEEGFn(beam.DoFn):
 
             if raw.get_data().nbytes == 0:
                 meta["error"] = "No EEG channels found"
+                yield beam.pvalue.TaggedOutput("failed", meta)
+                return
+
+            duration_s = raw.n_times / raw.info["sfreq"]
+            if duration_s < H5_CHUNK_SECONDS:
+                meta["error"] = f"Recording too short ({duration_s:.1f}s < {H5_CHUNK_SECONDS}s)"
                 yield beam.pvalue.TaggedOutput("failed", meta)
                 return
 
@@ -229,7 +237,7 @@ class PreprocessEEGFn(beam.DoFn):
 
         self._set_montage(raw)
 
-        raw.filter(l_freq=0.5, h_freq=42.0, fir_design="firwin")
+        raw.filter(l_freq=BANDPASS_LOW, h_freq=BANDPASS_HIGH, fir_design="firwin")
 
         if powerline_freq and powerline_freq > 0:
             freqs = [powerline_freq]
@@ -243,12 +251,11 @@ class PreprocessEEGFn(beam.DoFn):
             meta["dropped_ref_channel"] = ref_channel
             logger.info("Dropped original reference channel '%s' from data", ref_channel)
 
-        ch_data = raw.get_data()
-        rms = np.sqrt(np.mean(ch_data ** 2, axis=1))
+        rms = np.sqrt(np.mean(raw._data ** 2, axis=1))
         median_rms = np.median(rms)
-        std_rms = np.std(rms)
-        bad_mask = np.abs(rms - median_rms) > 3 * std_rms
+        bad_mask = np.abs(rms - median_rms) > 3 * np.std(rms)
         bad_channels = [raw.ch_names[i] for i, is_bad in enumerate(bad_mask) if is_bad]
+        del rms
 
         if bad_channels and len(bad_channels) < len(raw.ch_names) * 0.3:
             pos = raw._get_channel_positions()
@@ -270,35 +277,103 @@ class PreprocessEEGFn(beam.DoFn):
                 raw.info["bads"] = []
         meta["bad_channels"] = bad_channels
 
-        avg_keywords = {"average", "average reference", "common average",
-                        "common average reference", "car", "common"}
-        ref_parts = {p.strip().lower() for p in dataset_ref.split(";")} if dataset_ref else set()
-        already_avg = bool(ref_parts & avg_keywords)
-        if already_avg:
-            meta["reference"] = dataset_ref
-            logger.info("Skipping re-reference: already '%s'", dataset_ref)
-        else:
+        reref_action = self._classify_reference(dataset_ref)
+        if reref_action == "reref":
             raw.set_eeg_reference("average", projection=False)
             meta["reference"] = "average"
-            if dataset_ref:
-                meta["original_reference"] = dataset_ref
-
-        data = raw.get_data()
-        mean = np.mean(data, axis=1, keepdims=True)
-        std = np.std(data, axis=1, keepdims=True)
-        std[std < 1e-10] = 1.0
-        normalized = (data - mean) / std
-        np.clip(normalized, -15, 15, out=normalized)
-        raw._data = normalized
-        meta["z_normalized"] = True
-        meta["clip_std"] = 15
+            meta["original_reference"] = dataset_ref
+            logger.info("Re-referenced to average (was '%s')", dataset_ref)
+        else:
+            meta["reference"] = dataset_ref or "unknown"
+            logger.info("Keeping original reference '%s' (%s)", dataset_ref, reref_action)
 
         if self._target_sfreq and raw.info["sfreq"] != self._target_sfreq:
             meta["original_sfreq"] = raw.info["sfreq"]
-            raw.resample(self._target_sfreq)
+            raw.resample(self._target_sfreq, method="polyphase")
             meta["resampled_to"] = self._target_sfreq
 
+        data = raw._data
+        mean = np.mean(data, axis=1, keepdims=True)
+        std = np.std(data, axis=1, keepdims=True)
+        std[std < 1e-10] = 1.0
+        data -= mean
+        data /= std
+        del mean, std
+        np.clip(data, -CLIP_STD, CLIP_STD, out=data)
+        meta["z_normalized"] = True
+        meta["clip_std"] = CLIP_STD
+
         return meta
+
+    REREF_KEYWORDS = {
+        "linked ears", "linked ear", "linked mastoids", "linked mastoid",
+        "mastoids", "mastoid", "contralateral mastoids", "contralateral mastoid",
+        "contralateral",
+        "cms/drl", "cms", "drl",
+        "common",
+    }
+
+    KEEP_KEYWORDS = {
+        "average", "average reference", "common average",
+        "common average reference", "car",
+    }
+
+    _ELECTRODE_PATTERN = None
+
+    @staticmethod
+    def _is_electrode_name(token):
+        """Return True if token looks like a single-electrode name (Cz, FCz, etc.)."""
+        import re
+        if PreprocessEEGFn._ELECTRODE_PATTERN is None:
+            PreprocessEEGFn._ELECTRODE_PATTERN = re.compile(
+                r"^(fp[12z]|af[34578z]|f[1-8z]|fc[1-6z]|c[1-6z]|"
+                r"cp[1-6z]|p[1-8oz]|po[34578z]|o[12z]|"
+                r"t[3-6]|t[78]|tp[789]|tp10|a[12]|m[12]|"
+                r"fpz|oz|iz|nz|ref)$",
+                re.IGNORECASE,
+            )
+        return bool(PreprocessEEGFn._ELECTRODE_PATTERN.match(token))
+
+    @staticmethod
+    def _classify_reference(dataset_ref):
+        """Classify a reference string into 'keep' or 'reref'.
+
+        Re-ref to average only for: linked ears, mastoid, CMS/DRL, common.
+        Keep as-is for: average, single-electrode (Cz, FCz, etc.), unknown.
+        When a compound ref like "Cz; common" has both an electrode name
+        and a reref keyword, the electrode takes priority — keep as-is.
+        """
+        if not dataset_ref:
+            return "keep_unknown"
+
+        ref_lower = dataset_ref.lower().strip()
+        ref_parts = [p.strip() for p in ref_lower.replace(",", ";").split(";")]
+
+        part_set = set(ref_parts)
+        if part_set & PreprocessEEGFn.KEEP_KEYWORDS:
+            return "keep_average"
+
+        has_electrode = any(
+            PreprocessEEGFn._is_electrode_name(p) for p in ref_parts
+        )
+        has_reref = False
+        for part in ref_parts:
+            if part in PreprocessEEGFn.REREF_KEYWORDS:
+                has_reref = True
+                break
+            for kw in PreprocessEEGFn.REREF_KEYWORDS:
+                if kw in part:
+                    has_reref = True
+                    break
+            if has_reref:
+                break
+
+        if has_reref and has_electrode:
+            return "keep_online_ref"
+        if has_reref:
+            return "reref"
+
+        return "keep_online_ref"
 
     SKIP_REF_TOKENS = {
         "average", "average reference", "common average",
@@ -376,23 +451,25 @@ class PreprocessEEGFn(beam.DoFn):
             return None
 
         ch_names_lower = {ch.lower(): ch for ch in raw.ch_names}
-        all_rms = np.sqrt(np.mean(raw.get_data() ** 2, axis=1))
+        all_rms = np.sqrt(np.mean(raw._data ** 2, axis=1))
         median_rms = np.median(all_rms)
 
         for candidate in candidates:
             if candidate in ch_names_lower:
                 ch_name = ch_names_lower[candidate]
                 idx = raw.ch_names.index(ch_name)
-                ch_data = raw.get_data(picks=[idx])
-                rms = np.sqrt(np.mean(ch_data ** 2))
+                rms = np.sqrt(np.mean(raw._data[idx] ** 2))
                 if median_rms > 0 and rms < median_rms * 0.01:
                     return ch_name
         return None
 
     def _save_hdf5(self, raw, h5_path, preproc_meta):
-        data = raw.get_data().astype(np.float32)
+        data = raw._data.astype(np.float32)
+        raw._data = None
+        chunk_samples = int(raw.info["sfreq"] * H5_CHUNK_SECONDS)
+        chunk_samples = min(chunk_samples, data.shape[1])
         with h5py.File(h5_path, "w") as f:
-            f.create_dataset("data", data=data, compression="gzip", compression_opts=4)
+            f.create_dataset("data", data=data, chunks=(data.shape[0], chunk_samples))
 
             f.attrs["sfreq"] = raw.info["sfreq"]
             f.attrs["n_channels"] = data.shape[0]
@@ -404,8 +481,8 @@ class PreprocessEEGFn(beam.DoFn):
             f.create_dataset("channel_names", data=ch_names)
 
             preproc_group = f.create_group("preprocessing")
-            preproc_group.attrs["bandpass_low"] = 0.5
-            preproc_group.attrs["bandpass_high"] = 42.0
+            preproc_group.attrs["bandpass_low"] = BANDPASS_LOW
+            preproc_group.attrs["bandpass_high"] = BANDPASS_HIGH
             preproc_group.attrs["reference"] = preproc_meta.get("reference", "average")
             preproc_group.attrs["z_normalized"] = preproc_meta.get("z_normalized", False)
 

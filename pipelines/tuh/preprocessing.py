@@ -4,11 +4,12 @@ Preprocessing steps (in order):
   1. Clean channel names: strip 'EEG ' prefix and '-REF'/'-LE' suffix
   2. Drop non-EEG channels (EKG, EOG, EMG, respiration, photic, markers)
   3. Set standard 10-20 montage
-  4. Bandpass filter (0.5-42 Hz, FIR)
+  4. Bandpass filter (0.5-45 Hz, FIR)
   5. Notch filter (60 Hz + harmonics — TUH is US hospital data)
   6. Bad channel detection (RMS > 3 SD from median) and interpolation
-  7. Re-reference to average
-     (skipped for 01_tcp_ar/03_tcp_ar_a which are already average-referenced)
+  7. Selective re-reference to average
+     Only re-references linked-ears montages (02_tcp_le, 04_tcp_le_a).
+     Keeps as-is: average-referenced montages (01_tcp_ar, 03_tcp_ar_a).
   8. Z-score normalization per channel + clip at ±15 SD
   9. Resample to target frequency (optional, via --target-sfreq)
 
@@ -51,6 +52,7 @@ import h5py
 import mne
 import numpy as np
 
+from pipelines import BANDPASS_LOW, BANDPASS_HIGH, CLIP_STD, H5_CHUNK_SECONDS
 from pipelines.gcs_fs import GCSDatasetFS
 from pipelines.tuh.file_groups import TUHFileGroup
 
@@ -174,6 +176,12 @@ class TUHPreprocessEEGFn(beam.DoFn):
             if non_eeg:
                 raw.drop_channels(non_eeg)
 
+            duration_s = raw.n_times / raw.info["sfreq"]
+            if duration_s < H5_CHUNK_SECONDS:
+                meta["error"] = f"Recording too short ({duration_s:.1f}s < {H5_CHUNK_SECONDS}s)"
+                yield beam.pvalue.TaggedOutput("failed", meta)
+                return
+
             rename_map = {}
             for ch in raw.ch_names:
                 clean = _clean_channel_name(ch)
@@ -246,19 +254,18 @@ class TUHPreprocessEEGFn(beam.DoFn):
 
         self._set_montage(raw)
 
-        raw.filter(l_freq=0.5, h_freq=42.0, fir_design="firwin")
+        raw.filter(l_freq=BANDPASS_LOW, h_freq=BANDPASS_HIGH, fir_design="firwin")
 
         freqs = [TUH_POWERLINE_FREQ]
         if TUH_POWERLINE_FREQ * 2 <= raw.info["sfreq"] / 2:
             freqs.append(TUH_POWERLINE_FREQ * 2)
         raw.notch_filter(freqs)
 
-        ch_data = raw.get_data()
-        rms = np.sqrt(np.mean(ch_data ** 2, axis=1))
+        rms = np.sqrt(np.mean(raw._data ** 2, axis=1))
         median_rms = np.median(rms)
-        std_rms = np.std(rms)
-        bad_mask = np.abs(rms - median_rms) > 3 * std_rms
+        bad_mask = np.abs(rms - median_rms) > 3 * np.std(rms)
         bad_channels = [raw.ch_names[i] for i, is_bad in enumerate(bad_mask) if is_bad]
+        del rms
 
         if bad_channels and len(bad_channels) < len(raw.ch_names) * 0.3:
             pos = raw._get_channel_positions()
@@ -289,27 +296,31 @@ class TUHPreprocessEEGFn(beam.DoFn):
             meta["reference"] = "average"
             meta["original_reference"] = montage_dir
 
-        data = raw.get_data()
+        if self._target_sfreq and raw.info["sfreq"] != self._target_sfreq:
+            meta["original_sfreq"] = raw.info["sfreq"]
+            raw.resample(self._target_sfreq, method="polyphase")
+            meta["resampled_to"] = self._target_sfreq
+
+        data = raw._data
         mean = np.mean(data, axis=1, keepdims=True)
         std = np.std(data, axis=1, keepdims=True)
         std[std < 1e-10] = 1.0
-        normalized = (data - mean) / std
-        np.clip(normalized, -15, 15, out=normalized)
-        raw._data = normalized
+        data -= mean
+        data /= std
+        del mean, std
+        np.clip(data, -CLIP_STD, CLIP_STD, out=data)
         meta["z_normalized"] = True
-        meta["clip_std"] = 15
-
-        if self._target_sfreq and raw.info["sfreq"] != self._target_sfreq:
-            meta["original_sfreq"] = raw.info["sfreq"]
-            raw.resample(self._target_sfreq)
-            meta["resampled_to"] = self._target_sfreq
+        meta["clip_std"] = CLIP_STD
 
         return meta
 
     def _save_hdf5(self, raw, h5_path, preproc_meta, montage_dir):
-        data = raw.get_data().astype(np.float32)
+        data = raw._data.astype(np.float32)
+        raw._data = None
+        chunk_samples = int(raw.info["sfreq"] * H5_CHUNK_SECONDS)
+        chunk_samples = min(chunk_samples, data.shape[1])
         with h5py.File(h5_path, "w") as f:
-            f.create_dataset("data", data=data, compression="gzip", compression_opts=4)
+            f.create_dataset("data", data=data, chunks=(data.shape[0], chunk_samples))
 
             f.attrs["sfreq"] = raw.info["sfreq"]
             f.attrs["n_channels"] = data.shape[0]
@@ -322,8 +333,8 @@ class TUHPreprocessEEGFn(beam.DoFn):
             f.create_dataset("channel_names", data=ch_names)
 
             preproc_group = f.create_group("preprocessing")
-            preproc_group.attrs["bandpass_low"] = 0.5
-            preproc_group.attrs["bandpass_high"] = 42.0
+            preproc_group.attrs["bandpass_low"] = BANDPASS_LOW
+            preproc_group.attrs["bandpass_high"] = BANDPASS_HIGH
             preproc_group.attrs["notch_freq"] = TUH_POWERLINE_FREQ
             preproc_group.attrs["reference"] = preproc_meta.get("reference", "average")
             preproc_group.attrs["z_normalized"] = preproc_meta.get("z_normalized", False)

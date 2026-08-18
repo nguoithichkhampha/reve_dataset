@@ -24,7 +24,7 @@ Usage:
         --machine_type n1-highmem-4 \
         --max_num_workers 32 \
         --disk_size_gb 500 \
-        --disk_type pd-ssd \
+        --disk_type compute.googleapis.com/projects/emotivml/zones/us-central1-a/diskTypes/pd-ssd \
         --no-wait
 """
 

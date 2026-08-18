@@ -129,25 +129,47 @@ class CollectDatasetStatsFn(beam.DoFn):
         references = set()
         manufacturers = set()
 
+        data_file_sizes = {}
+        for suffix in (".edf", ".bdf", ".eeg"):
+            for rel_path, size in fs.list_blobs(suffix=suffix):
+                data_file_sizes[rel_path] = size
+
+        vhdr_cache = {}
+        for rel_path, _ in fs.list_blobs(suffix=".vhdr"):
+            vhdr_cache[rel_path] = None
+
         for rel_path, _ in fs.list_blobs(suffix="_eeg.json"):
             try:
                 text = fs.read_text(rel_path)
                 params = parse_eeg_json(text)
                 if "sampling_rate" in params:
                     sampling_rates.add(params["sampling_rate"])
-                if "duration" in params:
-                    dur = params["duration"]
+
+                dur = params.get("duration")
+                if dur is None:
+                    dur = self._duration_from_edf(fs, rel_path, data_file_sizes)
+                if dur is None:
+                    dur = self._duration_from_vhdr(fs, rel_path, data_file_sizes, vhdr_cache)
+
+                if dur is not None and dur > 0:
                     durations.append(dur)
                     fname = rel_path.rsplit("/", 1)[-1] if "/" in rel_path else rel_path
                     task = extract_task_from_filename(fname)
                     if task:
                         task_durations[task] = task_durations.get(task, 0.0) + dur
+
                 if "reference" in params:
                     references.add(params["reference"])
                 if "manufacturer" in params:
                     manufacturers.add(params["manufacturer"])
             except Exception:
                 continue
+
+        if not durations:
+            self._durations_from_data_files(
+                fs, data_file_sizes, vhdr_cache,
+                durations, task_durations, extract_task_from_filename,
+            )
 
         return {
             "sampling_rates": sorted(sampling_rates),
@@ -156,6 +178,127 @@ class CollectDatasetStatsFn(beam.DoFn):
             "references": sorted(references),
             "manufacturers": sorted(manufacturers),
         }
+
+    def _duration_from_edf(self, fs, json_path, data_file_sizes):
+        """Read duration from EDF/BDF header when _eeg.json lacks RecordingDuration."""
+        edf_path = json_path.replace("_eeg.json", "_eeg.edf")
+        size = data_file_sizes.get(edf_path)
+        if not size:
+            edf_path = json_path.replace("_eeg.json", "_eeg.bdf")
+            size = data_file_sizes.get(edf_path)
+        if not size or size < 256:
+            return None
+        try:
+            header = fs.read_bytes(edf_path, start=0, end=255)
+            n_records = int(header[236:244].decode("ascii", errors="replace").strip())
+            record_duration = float(header[244:252].decode("ascii", errors="replace").strip())
+            if n_records > 0 and record_duration > 0:
+                return n_records * record_duration
+        except Exception:
+            pass
+        return None
+
+    def _duration_from_vhdr(self, fs, json_path, data_file_sizes, vhdr_cache):
+        """Compute duration from BrainVision .vhdr + .eeg file size."""
+        vhdr_path = json_path.replace("_eeg.json", "_eeg.vhdr")
+        if vhdr_path not in vhdr_cache:
+            return None
+
+        if vhdr_cache[vhdr_path] is None:
+            try:
+                text = fs.read_text(vhdr_path)
+                n_channels = None
+                sampling_interval = None
+                binary_format = None
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line.startswith("NumberOfChannels="):
+                        n_channels = int(line.split("=", 1)[1])
+                    elif line.startswith("SamplingInterval="):
+                        sampling_interval = float(line.split("=", 1)[1])
+                    elif line.startswith("BinaryFormat="):
+                        binary_format = line.split("=", 1)[1].strip()
+                vhdr_cache[vhdr_path] = {
+                    "n_channels": n_channels,
+                    "sampling_interval_us": sampling_interval,
+                    "binary_format": binary_format,
+                }
+            except Exception:
+                vhdr_cache[vhdr_path] = {}
+
+        info = vhdr_cache[vhdr_path]
+        n_ch = info.get("n_channels")
+        si_us = info.get("sampling_interval_us")
+        fmt = info.get("binary_format", "")
+        if not n_ch or not si_us:
+            return None
+
+        bytes_per_sample = 4 if "FLOAT" in fmt.upper() else 2
+        sfreq = 1_000_000 / si_us
+
+        eeg_path = json_path.replace("_eeg.json", "_eeg.eeg")
+        eeg_size = data_file_sizes.get(eeg_path)
+        if not eeg_size:
+            return None
+
+        n_samples = eeg_size / (n_ch * bytes_per_sample)
+        return n_samples / sfreq
+
+    def _durations_from_data_files(
+        self, fs, data_file_sizes, vhdr_cache,
+        durations, task_durations, extract_task_fn,
+    ):
+        """Scan data files directly when no _eeg.json provided per-file durations."""
+        for path, size in data_file_sizes.items():
+            if "derivatives/" in path:
+                continue
+            dur = None
+            if path.endswith((".edf", ".bdf")) and size >= 256:
+                try:
+                    header = fs.read_bytes(path, start=0, end=255)
+                    n_records = int(header[236:244].decode("ascii", errors="replace").strip())
+                    rec_dur = float(header[244:252].decode("ascii", errors="replace").strip())
+                    if n_records > 0 and rec_dur > 0:
+                        dur = n_records * rec_dur
+                except Exception:
+                    pass
+            elif path.endswith(".eeg"):
+                vhdr_path = path[:-4] + ".vhdr"
+                if vhdr_path in vhdr_cache:
+                    if vhdr_cache[vhdr_path] is None:
+                        try:
+                            text = fs.read_text(vhdr_path)
+                            n_ch = si_us = fmt = None
+                            for line in text.splitlines():
+                                line = line.strip()
+                                if line.startswith("NumberOfChannels="):
+                                    n_ch = int(line.split("=", 1)[1])
+                                elif line.startswith("SamplingInterval="):
+                                    si_us = float(line.split("=", 1)[1])
+                                elif line.startswith("BinaryFormat="):
+                                    fmt = line.split("=", 1)[1].strip()
+                            vhdr_cache[vhdr_path] = {
+                                "n_channels": n_ch,
+                                "sampling_interval_us": si_us,
+                                "binary_format": fmt,
+                            }
+                        except Exception:
+                            vhdr_cache[vhdr_path] = {}
+                    info = vhdr_cache[vhdr_path]
+                    n_ch = info.get("n_channels")
+                    si_us = info.get("sampling_interval_us")
+                    bfmt = info.get("binary_format", "")
+                    if n_ch and si_us:
+                        bps = 4 if "FLOAT" in (bfmt or "").upper() else 2
+                        sfreq = 1_000_000 / si_us
+                        dur = size / (n_ch * bps) / sfreq
+
+            if dur is not None and dur > 0:
+                durations.append(dur)
+                fname = path.rsplit("/", 1)[-1] if "/" in path else path
+                task = extract_task_fn(fname)
+                if task:
+                    task_durations[task] = task_durations.get(task, 0.0) + dur
 
     def _get_eeg_channels(self, fs):
         channel_lists = []
@@ -307,7 +450,7 @@ def run(argv=None):
         )
     )
 
-    (
+    _ = (
         stats
         | "GatherAll" >> beam.combiners.ToList()
         | "FormatAndWrite" >> beam.ParDo(
