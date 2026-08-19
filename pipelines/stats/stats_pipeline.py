@@ -87,7 +87,7 @@ class CollectDatasetStatsFn(beam.DoFn):
             "eeg_channels": eeg_channels or [],
             "durations": eeg_params["durations"],
             "task_durations": eeg_params["task_durations"],
-            "tasks": sorted(file_stats["task_sizes"].keys()),
+            "tasks": sorted(file_stats["eeg_tasks"]),
             "references": eeg_params["references"],
             "manufacturers": eeg_params["manufacturers"],
             "eeg_formats": file_stats["eeg_formats"],
@@ -324,15 +324,16 @@ class CollectDatasetStatsFn(beam.DoFn):
             except Exception:
                 continue
 
-        for rel_path, size in fs.list_blobs(suffix=".edf"):
-            try:
-                needed = min(256 + 16 * 512, size)
-                header = fs.read_bytes(rel_path, start=0, end=needed - 1)
-                names = parse_edf_header_channels(header)
-                if names:
-                    return names
-            except Exception:
-                continue
+        for suffix in (".edf", ".bdf"):
+            for rel_path, size in fs.list_blobs(suffix=suffix):
+                try:
+                    needed = min(256 + 16 * 512, size)
+                    header = fs.read_bytes(rel_path, start=0, end=needed - 1)
+                    names = parse_edf_header_channels(header)
+                    if names:
+                        return names
+                except Exception:
+                    continue
 
         return []
 

@@ -45,6 +45,7 @@ by n_channels, task, and subject.
     n_channels, sfreq, n_samples, duration_s
 """
 
+import hashlib
 import logging
 import os
 import shutil
@@ -90,7 +91,10 @@ class PreprocessEEGFn(beam.DoFn):
         self._shard_map = shard_map or {}
 
     def setup(self):
+        logging.getLogger("pipelines").setLevel(logging.INFO)
         mne.set_log_level("WARNING")
+        from google.cloud import storage
+        self._client = storage.Client(project=self._project)
 
     def process(self, file_group_dict):
         fg = EEGFileGroup.from_dict(file_group_dict)
@@ -108,8 +112,13 @@ class PreprocessEEGFn(beam.DoFn):
         }
 
         try:
+            logger.info(
+                "Processing %s/%s (%.1f MB, %s)",
+                fg.dataset_id, fg.primary_blob,
+                fg.total_bytes / 1024 / 1024, fg.format,
+            )
             ds_prefix = f"{self._prefix}{fg.dataset_id}"
-            fs = GCSDatasetFS(self._bucket_name, ds_prefix, project=self._project)
+            fs = GCSDatasetFS(self._bucket_name, ds_prefix, client=self._client)
 
             all_blobs = [fg.primary_blob] + fg.aux_blobs
             for blob_path in all_blobs:
@@ -142,7 +151,7 @@ class PreprocessEEGFn(beam.DoFn):
             raw = reader(primary_local, preload=True)
             raw.pick_types(eeg=True, exclude=[])
 
-            if raw.get_data().nbytes == 0:
+            if len(raw.ch_names) == 0 or raw.n_times == 0:
                 meta["error"] = "No EEG channels found"
                 yield beam.pvalue.TaggedOutput("failed", meta)
                 return
@@ -162,14 +171,13 @@ class PreprocessEEGFn(beam.DoFn):
             self._save_hdf5(raw, h5_local, preproc_meta)
 
             temp_prefix = self._output_prefix.rstrip("/") + "_temp/"
-            temp_fs = GCSDatasetFS(self._bucket_name, temp_prefix, project=self._project)
+            temp_fs = GCSDatasetFS(self._bucket_name, temp_prefix, client=self._client)
             temp_fs.upload_from_file(temp_blob, h5_local)
 
             meta["status"] = "success"
             meta["temp_blob"] = temp_blob
             meta["n_channels"] = len(raw.ch_names)
             meta["sfreq"] = raw.info["sfreq"]
-            meta["channel_names"] = raw.ch_names
             meta["processing_time_s"] = round(time.time() - t0, 1)
             meta["output_size_bytes"] = os.path.getsize(h5_local)
 
@@ -184,7 +192,7 @@ class PreprocessEEGFn(beam.DoFn):
         if meta["status"] == "success":
             n_shards = self._shard_map.get(fg.dataset_id, 1)
             if n_shards > 1:
-                shard = hash(fg.subject) % n_shards
+                shard = int(hashlib.md5(fg.subject.encode()).hexdigest(), 16) % n_shards
                 key = f"{fg.dataset_id}_shard{shard:03d}"
             else:
                 key = fg.dataset_id
@@ -196,13 +204,7 @@ class PreprocessEEGFn(beam.DoFn):
         """Read powerline frequency and EEG reference from sidecar JSON."""
         result = {"powerline_freq": 50.0, "reference": None}
 
-        sources = list(fg.sidecar_blobs)
-        try:
-            sources.extend(path for path, _ in fs.list_blobs(suffix="_eeg.json"))
-        except Exception:
-            pass
-
-        for path in sources:
+        for path in fg.sidecar_blobs:
             try:
                 text = fs.read_text(path)
                 params = parse_eeg_json(text)
@@ -263,13 +265,15 @@ class PreprocessEEGFn(beam.DoFn):
                 freqs.append(powerline_freq * 2)
             raw.notch_filter(freqs)
 
-        ref_channel = self._find_ref_channel_in_data(raw, dataset_ref)
+        rms = np.sqrt(np.mean(raw._data ** 2, axis=1))
+
+        ref_channel = self._find_ref_channel_in_data(raw, dataset_ref, all_rms=rms)
         if ref_channel:
             raw.drop_channels([ref_channel])
             meta["dropped_ref_channel"] = ref_channel
             logger.info("Dropped original reference channel '%s' from data", ref_channel)
+            rms = np.sqrt(np.mean(raw._data ** 2, axis=1))
 
-        rms = np.sqrt(np.mean(raw._data ** 2, axis=1))
         median_rms = np.median(rms)
         bad_mask = np.abs(rms - median_rms) > 3 * np.std(rms)
         bad_channels = [raw.ch_names[i] for i, is_bad in enumerate(bad_mask) if is_bad]
@@ -327,13 +331,16 @@ class PreprocessEEGFn(beam.DoFn):
         "linked ears", "linked ear", "linked mastoids", "linked mastoid",
         "mastoids", "mastoid", "contralateral mastoids", "contralateral mastoid",
         "contralateral",
-        "cms/drl", "cms", "drl",
         "common",
     }
 
     KEEP_KEYWORDS = {
         "average", "average reference", "common average",
         "common average reference", "car",
+    }
+
+    KEEP_SYSTEM_KEYWORDS = {
+        "cms/drl", "cms", "drl",
     }
 
     _ELECTRODE_PATTERN = None
@@ -356,8 +363,8 @@ class PreprocessEEGFn(beam.DoFn):
     def _classify_reference(dataset_ref):
         """Classify a reference string into 'keep' or 'reref'.
 
-        Re-ref to average only for: linked ears, mastoid, CMS/DRL, common.
-        Keep as-is for: average, single-electrode (Cz, FCz, etc.), unknown.
+        Re-ref to average only for: linked ears, mastoid, common.
+        Keep as-is for: average, CMS/DRL, single-electrode (Cz, FCz, etc.), unknown.
         When a compound ref like "Cz; common" has both an electrode name
         and a reref keyword, the electrode takes priority — keep as-is.
         """
@@ -370,6 +377,9 @@ class PreprocessEEGFn(beam.DoFn):
         part_set = set(ref_parts)
         if part_set & PreprocessEEGFn.KEEP_KEYWORDS:
             return "keep_average"
+
+        if part_set & PreprocessEEGFn.KEEP_SYSTEM_KEYWORDS:
+            return "keep_system_ref"
 
         has_electrode = any(
             PreprocessEEGFn._is_electrode_name(p) for p in ref_parts
@@ -450,7 +460,7 @@ class PreprocessEEGFn(beam.DoFn):
         return candidates
 
     @staticmethod
-    def _find_ref_channel_in_data(raw, dataset_ref):
+    def _find_ref_channel_in_data(raw, dataset_ref, all_rms=None):
         """Check if the original reference channel is present and flat.
 
         Parses compound reference strings, matches against channel names,
@@ -469,15 +479,15 @@ class PreprocessEEGFn(beam.DoFn):
             return None
 
         ch_names_lower = {ch.lower(): ch for ch in raw.ch_names}
-        all_rms = np.sqrt(np.mean(raw._data ** 2, axis=1))
+        if all_rms is None:
+            all_rms = np.sqrt(np.mean(raw._data ** 2, axis=1))
         median_rms = np.median(all_rms)
 
         for candidate in candidates:
             if candidate in ch_names_lower:
                 ch_name = ch_names_lower[candidate]
                 idx = raw.ch_names.index(ch_name)
-                rms = np.sqrt(np.mean(raw._data[idx] ** 2))
-                if median_rms > 0 and rms < median_rms * 0.01:
+                if median_rms > 0 and all_rms[idx] < median_rms * 0.01:
                     return ch_name
         return None
 
@@ -487,7 +497,9 @@ class PreprocessEEGFn(beam.DoFn):
         chunk_samples = int(raw.info["sfreq"] * H5_CHUNK_SECONDS)
         chunk_samples = min(chunk_samples, data.shape[1])
         with h5py.File(h5_path, "w") as f:
-            f.create_dataset("data", data=data, chunks=(data.shape[0], chunk_samples))
+            f.create_dataset("data", data=data,
+                             chunks=(data.shape[0], chunk_samples),
+                             )
 
             f.attrs["sfreq"] = raw.info["sfreq"]
             f.attrs["n_channels"] = data.shape[0]
@@ -530,6 +542,11 @@ class MergeDatasetHDF5Fn(beam.DoFn):
         self._output_prefix = output_prefix
         self._project = project
 
+    def setup(self):
+        logging.getLogger("pipelines").setLevel(logging.INFO)
+        from google.cloud import storage
+        self._client = storage.Client(project=self._project)
+
     def process(self, element):
         merge_key, recording_metas = element
         recording_metas = list(recording_metas)
@@ -545,7 +562,7 @@ class MergeDatasetHDF5Fn(beam.DoFn):
 
         tmp_dir = tempfile.mkdtemp(prefix="eeg_merge_")
         temp_prefix = self._output_prefix.rstrip("/") + "_temp/"
-        temp_fs = GCSDatasetFS(self._bucket_name, temp_prefix, project=self._project)
+        temp_fs = GCSDatasetFS(self._bucket_name, temp_prefix, client=self._client)
 
         try:
             merged_path = os.path.join(tmp_dir, f"{merge_key}_preprocessed.h5")
@@ -613,17 +630,18 @@ class MergeDatasetHDF5Fn(beam.DoFn):
                 else:
                     merged.attrs["sfreq"] = sorted(sfreqs)
 
-                if recording_metas and recording_metas[0].get("channel_names"):
-                    ch = [n.encode("utf-8") for n in recording_metas[0]["channel_names"]]
-                    merged.create_dataset("channel_names", data=ch)
+                first = recording_metas[0]
+                first_path = f"{first.get('subject', 'unknown')}/{first.get('task', 'unknown')}/{first.get('run', '1')}/channel_names"
+                if first_path in merged:
+                    merged.copy(first_path, merged, "channel_names")
 
             out_fs = GCSDatasetFS(
-                self._bucket_name, self._output_prefix, project=self._project
+                self._bucket_name, self._output_prefix, client=self._client
             )
             output_blob = f"{merge_key}_preprocessed.h5"
             out_fs.upload_from_file(output_blob, merged_path)
 
-            self._cleanup_temp_blobs(temp_fs, recording_metas)
+            self._cleanup_temp_blobs(recording_metas)
 
             output_path = f"gs://{self._bucket_name}/{self._output_prefix}{output_blob}"
             file_size = os.path.getsize(merged_path)
@@ -669,11 +687,11 @@ class MergeDatasetHDF5Fn(beam.DoFn):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _cleanup_temp_blobs(self, temp_fs, recording_metas):
-        from google.cloud import storage
-        client = storage.Client(project=self._project)
-        bucket = client.bucket(self._bucket_name)
+    def _cleanup_temp_blobs(self, recording_metas):
+        bucket = self._client.bucket(self._bucket_name)
         temp_prefix = self._output_prefix.rstrip("/") + "_temp/"
-        for meta in recording_metas:
-            blob_name = temp_prefix + meta["temp_blob"]
-            bucket.blob(blob_name).delete()
+        blobs = [bucket.blob(temp_prefix + m["temp_blob"]) for m in recording_metas]
+        for i in range(0, len(blobs), 100):
+            with self._client.batch():
+                for blob in blobs[i:i + 100]:
+                    blob.delete()

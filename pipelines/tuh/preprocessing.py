@@ -142,7 +142,10 @@ class TUHPreprocessEEGFn(beam.DoFn):
         self._target_sfreq = target_sfreq
 
     def setup(self):
+        logging.getLogger("pipelines").setLevel(logging.INFO)
         mne.set_log_level("WARNING")
+        from google.cloud import storage
+        self._client = storage.Client(project=self._project)
 
     def process(self, file_group_dict):
         fg = TUHFileGroup.from_dict(file_group_dict)
@@ -159,7 +162,7 @@ class TUHPreprocessEEGFn(beam.DoFn):
         }
 
         try:
-            fs = GCSDatasetFS(self._bucket_name, self._prefix, project=self._project)
+            fs = GCSDatasetFS(self._bucket_name, self._prefix, client=self._client)
 
             local_path = os.path.join(tmp_dir, os.path.basename(fg.blob_path))
             fs.download_to_file(fg.blob_path, local_path)
@@ -199,14 +202,13 @@ class TUHPreprocessEEGFn(beam.DoFn):
             self._save_hdf5(raw, h5_local, preproc_meta, fg.montage)
 
             temp_prefix = self._output_prefix.rstrip("/") + "_temp/"
-            temp_fs = GCSDatasetFS(self._bucket_name, temp_prefix, project=self._project)
+            temp_fs = GCSDatasetFS(self._bucket_name, temp_prefix, client=self._client)
             temp_fs.upload_from_file(temp_blob, h5_local)
 
             meta["status"] = "success"
             meta["temp_blob"] = temp_blob
             meta["n_channels"] = len(raw.ch_names)
             meta["sfreq"] = raw.info["sfreq"]
-            meta["channel_names"] = raw.ch_names
             meta["processing_time_s"] = round(time.time() - t0, 1)
             meta["output_size_bytes"] = os.path.getsize(h5_local)
 
@@ -320,7 +322,9 @@ class TUHPreprocessEEGFn(beam.DoFn):
         chunk_samples = int(raw.info["sfreq"] * H5_CHUNK_SECONDS)
         chunk_samples = min(chunk_samples, data.shape[1])
         with h5py.File(h5_path, "w") as f:
-            f.create_dataset("data", data=data, chunks=(data.shape[0], chunk_samples))
+            f.create_dataset("data", data=data,
+                             chunks=(data.shape[0], chunk_samples),
+                             )
 
             f.attrs["sfreq"] = raw.info["sfreq"]
             f.attrs["n_channels"] = data.shape[0]
@@ -365,6 +369,11 @@ class TUHMergeGroupHDF5Fn(beam.DoFn):
         self._output_prefix = output_prefix
         self._project = project
 
+    def setup(self):
+        logging.getLogger("pipelines").setLevel(logging.INFO)
+        from google.cloud import storage
+        self._client = storage.Client(project=self._project)
+
     def process(self, element):
         group_id, recording_metas = element
         recording_metas = list(recording_metas)
@@ -376,7 +385,7 @@ class TUHMergeGroupHDF5Fn(beam.DoFn):
 
         tmp_dir = tempfile.mkdtemp(prefix="tuh_merge_")
         temp_prefix = self._output_prefix.rstrip("/") + "_temp/"
-        temp_fs = GCSDatasetFS(self._bucket_name, temp_prefix, project=self._project)
+        temp_fs = GCSDatasetFS(self._bucket_name, temp_prefix, client=self._client)
 
         try:
             merged_path = os.path.join(tmp_dir, f"tuh_{group_id}_preprocessed.h5")
@@ -441,17 +450,18 @@ class TUHMergeGroupHDF5Fn(beam.DoFn):
                 else:
                     merged.attrs["sfreq"] = sorted(sfreqs)
 
-                if recording_metas and recording_metas[0].get("channel_names"):
-                    ch = [n.encode("utf-8") for n in recording_metas[0]["channel_names"]]
-                    merged.create_dataset("channel_names", data=ch)
+                first = recording_metas[0]
+                first_path = f"{first.get('patient_id', 'unknown')}/{first.get('session', 's001')}/{first.get('token', 't000')}/channel_names"
+                if first_path in merged:
+                    merged.copy(first_path, merged, "channel_names")
 
             out_fs = GCSDatasetFS(
-                self._bucket_name, self._output_prefix, project=self._project
+                self._bucket_name, self._output_prefix, client=self._client
             )
             output_blob = f"tuh_{group_id}_preprocessed.h5"
             out_fs.upload_from_file(output_blob, merged_path)
 
-            self._cleanup_temp_blobs(temp_fs, recording_metas)
+            self._cleanup_temp_blobs(recording_metas)
 
             output_path = f"gs://{self._bucket_name}/{self._output_prefix}{output_blob}"
             file_size = os.path.getsize(merged_path)
@@ -496,11 +506,11 @@ class TUHMergeGroupHDF5Fn(beam.DoFn):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _cleanup_temp_blobs(self, temp_fs, recording_metas):
-        from google.cloud import storage
-        client = storage.Client(project=self._project)
-        bucket = client.bucket(self._bucket_name)
+    def _cleanup_temp_blobs(self, recording_metas):
+        bucket = self._client.bucket(self._bucket_name)
         temp_prefix = self._output_prefix.rstrip("/") + "_temp/"
-        for meta in recording_metas:
-            blob_name = temp_prefix + meta["temp_blob"]
-            bucket.blob(blob_name).delete()
+        blobs = [bucket.blob(temp_prefix + m["temp_blob"]) for m in recording_metas]
+        for i in range(0, len(blobs), 100):
+            with self._client.batch():
+                for blob in blobs[i:i + 100]:
+                    blob.delete()

@@ -255,6 +255,7 @@ def compute_file_stats(blob_list):
     ext_counts = Counter()
     total_size = 0
     eeg_formats = set()
+    eeg_tasks = set()
     task_sizes = {}
     task_file_counts = {}
     task_subjects = {}
@@ -271,6 +272,8 @@ def compute_file_stats(blob_list):
         if task_name:
             task_sizes[task_name] = task_sizes.get(task_name, 0) + fsize
             task_file_counts[task_name] = task_file_counts.get(task_name, 0) + 1
+            if ext in EEG_PRIMARY_FORMATS:
+                eeg_tasks.add(task_name)
             parts = rel_path.split("/")
             sub = parts[0] if parts and parts[0].startswith("sub-") else ""
             if sub:
@@ -282,6 +285,7 @@ def compute_file_stats(blob_list):
         "ext_counts": ext_counts,
         "total_size": total_size,
         "eeg_formats": sorted(eeg_formats),
+        "eeg_tasks": eeg_tasks,
         "task_sizes": task_sizes,
         "task_file_counts": task_file_counts,
         "task_subjects": {t: len(s) for t, s in task_subjects.items()},

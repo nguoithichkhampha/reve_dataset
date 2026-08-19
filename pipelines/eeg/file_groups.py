@@ -65,7 +65,7 @@ def _parse_bids_entities(rel_path):
 
     subject = ""
     session = ""
-    for p in parts:
+    for p in parts[:-1]:
         if p.startswith("sub-"):
             subject = p
         elif p.startswith("ses-"):

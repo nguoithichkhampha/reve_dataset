@@ -9,6 +9,7 @@ Usage:
         --bucket emotiv-reve-data \
         --prefix openneuro/ \
         --output-prefix preprocessed/openneuro/ \
+        --direct_num_workers=0 \
         --datasets ds002680
 
     # Dataflow:
@@ -20,13 +21,14 @@ Usage:
         --project emotivml \
         --region us-central1 \
         --temp_location gs://emotiv-reve-data/dataflow-temp/ \
-        --setup_file ./setup.py \
-        --machine_type n1-highmem-8 \
-        --max_num_workers 32 \
-        --disk_size_gb 500 \
+        --setup_file=./setup.py \
+        --machine_type n1-highmem-4 \
+        --max_num_workers 64 \
+        --disk_size_gb 250 \
         --disk_type compute.googleapis.com/projects/emotivml/zones/us-central1-a/diskTypes/pd-ssd \
         --number_of_worker_harness_threads 1 \
-        --no-wait --target-sfreq 128
+        --no-wait --target-sfreq 128 \
+        --exclude-datasets ds004395 ds004706 ds004582 ds004356 ds004561 ds005089 ds003004 ds003825 ds003885 ds003887 ds004357 ds004477 ds005273 ds005586 ds005697
 """
 
 import json
@@ -41,6 +43,49 @@ from pipelines.eeg.preprocessing import MergeDatasetHDF5Fn, PreprocessEEGFn
 logger = logging.getLogger(__name__)
 
 MAX_FILE_BYTES = 20 * 1024**3
+
+
+class UpsertManifestFn(beam.DoFn):
+    """Read existing manifest CSV from GCS, replace rows for re-processed
+    datasets, append new rows, and write back."""
+
+    def __init__(self, bucket_name, blob_path, header, key_column, project=None):
+        self._bucket_name = bucket_name
+        self._blob_path = blob_path
+        self._header = header
+        self._key_column = key_column
+        self._project = project
+
+    def setup(self):
+        from google.cloud import storage
+        self._client = storage.Client(project=self._project)
+
+    def process(self, new_rows):
+        if not new_rows:
+            return
+        bucket = self._client.bucket(self._bucket_name)
+        blob = bucket.blob(self._blob_path)
+
+        key_idx = self._header.split(",").index(self._key_column)
+        new_keys = {row.split(",")[key_idx] for row in new_rows}
+
+        existing_rows = []
+        if blob.exists():
+            text = blob.download_as_text()
+            for line in text.strip().split("\n"):
+                if not line or line == self._header:
+                    continue
+                key = line.split(",")[key_idx]
+                if key not in new_keys:
+                    existing_rows.append(line)
+
+        all_rows = existing_rows + new_rows
+        content = self._header + "\n" + "\n".join(all_rows) + "\n"
+        blob.upload_from_string(content, content_type="text/csv")
+        logger.info(
+            "Manifest updated: %d existing + %d new = %d rows",
+            len(existing_rows), len(new_rows), len(all_rows),
+        )
 
 
 class DiscoverFileGroupsFn(beam.DoFn):
@@ -156,6 +201,7 @@ def run(argv=None):
         | "FilterBySize" >> beam.Filter(
             lambda fg: fg["total_bytes"] <= max_bytes
         )
+        | "RedistributeRecordings" >> beam.Reshuffle()
         | "Preprocess" >> beam.ParDo(
             PreprocessEEGFn(
                 known_args.bucket,
@@ -191,8 +237,8 @@ def run(argv=None):
         )
     )
 
-    # Write per-recording manifest CSV for dataloader filtering
     MANIFEST_HEADER = "dataset_id,h5_file,h5_path,subject,session,task,run,n_channels,sfreq,n_samples,duration_s"
+    manifest_csv_blob = f"{known_args.output_prefix}manifest_recordings.csv"
 
     def manifest_to_csv_row(row):
         return ",".join(str(row.get(col, "")) for col in MANIFEST_HEADER.split(","))
@@ -200,11 +246,15 @@ def run(argv=None):
     (
         merge_outputs.manifest
         | "ManifestToCSV" >> beam.Map(manifest_to_csv_row)
-        | "WriteManifestCSV" >> beam.io.WriteToText(
-            manifest_path + "_recordings",
-            file_name_suffix=".csv",
-            shard_name_template="",
-            header=MANIFEST_HEADER,
+        | "CollectRows" >> beam.combiners.ToList()
+        | "UpsertManifest" >> beam.ParDo(
+            UpsertManifestFn(
+                known_args.bucket,
+                manifest_csv_blob,
+                MANIFEST_HEADER,
+                key_column="dataset_id",
+                project=known_args.gcp_project,
+            )
         )
     )
 

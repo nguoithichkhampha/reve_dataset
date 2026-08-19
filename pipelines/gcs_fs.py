@@ -48,7 +48,10 @@ class GCSDatasetFS:
         if rel_prefix:
             search_prefix = self._prefix + rel_prefix
 
-        for blob in self._client.list_blobs(self._bucket, prefix=search_prefix):
+        for blob in self._client.list_blobs(
+            self._bucket, prefix=search_prefix,
+            fields="items(name,size),nextPageToken",
+        ):
             rel = blob.name[len(self._prefix):]
             if suffix and not rel.endswith(suffix):
                 continue
@@ -56,7 +59,10 @@ class GCSDatasetFS:
 
     def list_all_blobs(self):
         """List every blob under this dataset. Yields (relative_path, size)."""
-        for blob in self._client.list_blobs(self._bucket, prefix=self._prefix):
+        for blob in self._client.list_blobs(
+            self._bucket, prefix=self._prefix,
+            fields="items(name,size),nextPageToken",
+        ):
             yield blob.name[len(self._prefix):], blob.size
 
     def list_subject_dirs(self):
